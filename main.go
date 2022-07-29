@@ -19,47 +19,29 @@ package main
 import (
 	"encoding/json"
 	"flag"
-	errorLog "log"
+	"log"
 	"net/http"
 	"os"
+	"sync"
 
-	"github.com/go-kit/kit/log"
 	"github.com/prometheus/alertmanager/template"
 )
 
 type handler struct {
-	Logger log.Logger
+	logger   *log.Logger
+	alertsMu sync.Mutex
+	alerts   []template.Data
 }
 
 func main() {
 	address := flag.String("address", ":6725", "address and port of service")
-	json := flag.Bool("json", true, "enable json logging")
-	tls := flag.Bool("tls", false, "activate https instead of http")
-	tlsKeyPath := flag.String("tls-key", "key.pem", "path to the private key pem file for HTTPS")
-	tlsCertPath := flag.String("tls-cert", "cert.pem", "path to the certificate pem file for HTTPS")
 	flag.Parse()
 
-	lw := log.NewSyncWriter(os.Stdout)
-	var logger log.Logger
-	if *json {
-		logger = log.NewJSONLogger(lw)
-	} else {
-		logger = log.NewLogfmtLogger(lw)
-	}
-	logger = log.With(logger, "timestamp", log.DefaultTimestampUTC)
+	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmsgprefix)
+	http.Handle("/", &handler{logger: logger})
 
-	http.Handle("/", &handler{
-		Logger: logger,
-	})
-
-        if *tls {
-		if err := http.ListenAndServeTLS(*address, *tlsCertPath, *tlsKeyPath, nil); err != nil {
-			errorLog.Fatalf("failed to start https server: %v", err)
-                }
-        } else {
-		if err := http.ListenAndServe(*address, nil); err != nil {
-			errorLog.Fatalf("failed to start http server: %v", err)
-                }
+	if err := http.ListenAndServe(*address, nil); err != nil {
+		logger.Fatalf("failed to start http server: %v", err)
 	}
 }
 
@@ -67,12 +49,14 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var alerts template.Data
 	err := json.NewDecoder(r.Body).Decode(&alerts)
 	if err != nil {
-		errorLog.Printf("cannot parse content because of %s", err)
+		h.logger.Printf("cannot parse content because of %s", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	err = logAlerts(alerts, h.Logger)
+	h.storeAlerts(alerts)
+
+	err = logAlerts(alerts, h.logger)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		panic(err)
@@ -81,26 +65,15 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func logAlerts(alerts template.Data, logger log.Logger) error {
-	logger = logWith(alerts.CommonAnnotations, logger)
-	logger = logWith(alerts.CommonLabels, logger)
-	logger = logWith(alerts.GroupLabels, logger)
-	for _, alert := range alerts.Alerts {
-		alertLogger := logWith(alert.Labels, logger)
-		alertLogger = logWith(alert.Annotations, alertLogger)
+func (h *handler) storeAlerts(alerts template.Data) {
+	h.alertsMu.Lock()
+	defer h.alertsMu.Unlock()
 
-		err := alertLogger.Log("status", alert.Status, "startsAt", alert.StartsAt, "endsAt", alert.EndsAt, "generatorURL", alert.GeneratorURL, "externalURL", alerts.ExternalURL, "receiver", alerts.Receiver, "fingerprint", alert.Fingerprint)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	h.alerts = append(h.alerts, alerts)
 }
 
-func logWith(values map[string]string, logger log.Logger) log.Logger {
-	for k, v := range values {
-		logger = log.With(logger, k, v)
-	}
-	return logger
+func logAlerts(alerts template.Data, logger *log.Logger) error {
+	s, _ := json.Marshal(alerts)
+	logger.Println(string(s))
+	return nil
 }
